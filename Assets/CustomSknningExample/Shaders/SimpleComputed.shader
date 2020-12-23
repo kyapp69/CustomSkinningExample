@@ -9,6 +9,8 @@
 	{
 		Pass
 		{
+			Name "Forward"
+
 			CGPROGRAM
 
 			#pragma target 5.0
@@ -22,23 +24,21 @@
 	
 			struct v2f
 			{
-				float4 vertex : SV_POSITION;
-				float3 normal : NORMAL;
-				float2 uv : TEXCOORD0;
+				float4 positionCS	: SV_POSITION;
+				float3 positionWS	: TEXCOORD1;	
+				float2 uv			: TEXCOORD0;
 			};
 			
-			uniform StructuredBuffer<int> triangles;
-			uniform StructuredBuffer<DataPerVertex> vertices;
+			uniform StructuredBuffer<DataPerVertex> dataPerVertex;
 
-			v2f vert (uint triangleIndex : SV_VertexID)
+			v2f vert (uint vertexIndex : SV_VertexID)
 			{ 
-				uint vertexIndex = triangles[triangleIndex];
+				DataPerVertex vertex = dataPerVertex[vertexIndex];
 				v2f o;
 
-				o.vertex = UnityObjectToClipPos(vertices[vertexIndex].position);
-				o.normal = mul(vertices[vertexIndex].normal, unity_WorldToObject);
-
-				o.uv = vertices[vertexIndex].uv;
+				o.positionCS = UnityObjectToClipPos(vertex.position);
+				o.positionWS = vertex.position;
+				o.uv = vertex.uv;
 
 				return o;
 			}
@@ -48,10 +48,50 @@
 
 			fixed4 frag (v2f i) : SV_Target
 			{
-				float3 n = i.normal.xyz;
+				float3 n = cross(normalize(ddx(i.positionWS)), normalize(ddy(i.positionWS)));
 				float3 l = normalize(_WorldSpaceLightPos0);
+				float ndotl = max(min(dot(n, l), 1), 0);
+				return max(0.0, ndotl * (1 - _WrapLight) + _WrapLight) * _LightColor0 * _Color;
+			}
+			ENDCG
+		}
 
-				return max(0.0, dot(n, l) * (1 - _WrapLight) + _WrapLight) * _LightColor0 * _Color;
+		Pass
+		{
+			Name "ShadowCaster"
+
+			CGPROGRAM
+
+			#pragma target 5.0
+
+			#pragma vertex vert
+			#pragma fragment frag
+
+			#include "UnityCG.cginc"
+			#include "Lighting.cginc"
+			#include "DataDefination.cginc"
+
+			struct v2f
+			{
+				float4 positionCS	: SV_POSITION;
+			};
+
+			uniform StructuredBuffer<int> triangles;
+			uniform StructuredBuffer<DataPerVertex> dataPerVertex;
+
+			v2f vert(uint triangleIndex : SV_VertexID)
+			{
+				uint vertexIndex = triangles[triangleIndex];
+				v2f o;
+
+				o.positionCS = UnityObjectToClipPos(dataPerVertex[vertexIndex].position);
+
+				return o;
+			}
+
+			fixed4 frag(v2f i) : SV_Target
+			{
+				return fixed4(1, 1, 1, 1);
 			}
 			ENDCG
 		}

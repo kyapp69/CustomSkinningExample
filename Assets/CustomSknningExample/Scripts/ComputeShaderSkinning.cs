@@ -6,22 +6,27 @@
     using System.Runtime.InteropServices;
     using System.Text;
     using UnityEngine;
+    using UnityEngine.Rendering;
 
     public interface IDispatch { void Dispatch(); }
     public interface IDisposableDispatch : IDispatch, IDisposable { }
 
     public static class DispatcherFactory
     {
-        public static IDisposableDispatch CreateComputeBy(SkinningBlend method, ComputeShader computeShader, RenderChunk chunk, Transform[] bones, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream)
+        public static IDisposableDispatch CreateComputeBy(
+            SkinningBlend method, ComputeShader computeShader, RenderChunk chunk, Transform[] bones, 
+            Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream, 
+            Func<ComputeBuffer> getMinMaxBoundsBuffer
+            )
         {
             switch (method)
             {
                 case SkinningBlend.Linear:
-                    return new LinearBlendSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream);
+                    return new LinearBlendSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream, getMinMaxBoundsBuffer);
                 case SkinningBlend.DualQuaternion:
-                    return new DualQuaternionBlendSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream);
+                    return new DualQuaternionBlendSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream, getMinMaxBoundsBuffer);
                 case SkinningBlend.OptimizedCenterOfRotation:
-                    return new OptimizedCenterOfRotationSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream);
+                    return new OptimizedCenterOfRotationSkinningDispatcher(computeShader, chunk, bones, getPerVertexBuffer, getPerVertexSkinBuffer, getPerVertexStream, getMinMaxBoundsBuffer);
                 default:
                     return null;
             }
@@ -40,8 +45,10 @@
         public ComputeBuffer perVertexSkinBuffer;
         public ComputeBuffer perVertexStream;
 
-        public ComputeBuffer indexBuffer;
+        public GraphicsBuffer indexBuffer;
         public ComputeBuffer indexCountBuffer;
+
+        public ComputeBuffer minmaxBoundsBuffer;
 
         public IDispatch tensionDispatcher;
 
@@ -61,16 +68,19 @@
             perVertexStream = new ComputeBuffer(chunk.vertexCount, Marshal.SizeOf(typeof(DataPerVertex)));
             perVertexStream.SetData(chunk.dataPerVertex);
 
-            indexBuffer = new ComputeBuffer(chunk.indices.Length, sizeof(int));
+            indexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Index, chunk.indices.Length, sizeof(int));
             indexBuffer.SetData(chunk.indices);
 
             indexCountBuffer = new ComputeBuffer(chunk.indexCounts.Length, sizeof(int));
             indexCountBuffer.SetData(chunk.indexCounts);
 
+            minmaxBoundsBuffer = new ComputeBuffer(1, Marshal.SizeOf<Vector3>() * 2, ComputeBufferType.Structured);
+
             sourceDispatcher = new DataToDataDispatcher(
                                             computeShader, 
                                             () => perVertexBuffer, 
-                                            () => perVertexStream
+                                            () => perVertexStream,
+                                            () => minmaxBoundsBuffer
                                             );
             dispatchcer = DispatcherFactory.CreateComputeBy(
                                             method, 
@@ -79,18 +89,27 @@
                                             bones, 
                                             () => perVertexBuffer, 
                                             () => perVertexSkinBuffer, 
-                                            () => perVertexStream
+                                            () => perVertexStream,
+                                            () => minmaxBoundsBuffer
                                             );
 
             if (!tension)
             {
-                renderer = new ComputeShaderRenderer(
-                                                        chunk, 
-                                                        material, 
-                                                        () => perVertexStream, 
-                                                        () => indexBuffer,
-                                                        () => indexCountBuffer
-                                                    );
+                renderer = 
+                    new ComputeShaderRenderer(
+                        chunk, material, () => perVertexStream, () => indexBuffer, 
+                        () => 
+                        {
+                            Bounds b = new Bounds();
+                            // TODO:: REMOVE GC ALLOCATION, fixed or stack allocation as c# Array
+                            Vector3[] p = new Vector3[2];
+                            minmaxBoundsBuffer.GetData(p);
+                            b.center = (p[0] + p[1]) / 2.0f;
+                            b.extents = (p[1] - p[0]) / 2.0f;
+
+                            return b;
+                        }
+                    );
             }
             else
             {
@@ -100,15 +119,25 @@
                 tensionBuffer = new ComputeBuffer(chunk.vertexCount, sizeof(float));
                 tensionBuffer.SetData(new float[chunk.vertexCount]);
 
-                tensionDispatcher = new TensionDispatcher(
-                                                            computeShader, 
-                                                            chunk,
-                                                            () => perVertexStream,
-                                                            () => indexBuffer, 
-                                                            () => edgeLengthBuffer, 
-                                                            () => tensionBuffer
-                                                            );
-                renderer = new TensionRenderer(chunk, material, () => tensionBuffer, () => perVertexStream, () => indexBuffer, () => indexCountBuffer);
+                tensionDispatcher = 
+                    new TensionDispatcher(
+                        computeShader, chunk, 
+                        () => perVertexStream, () => indexBuffer, () => edgeLengthBuffer, () => tensionBuffer
+                    );
+                renderer = new TensionRenderer(
+                        chunk, material, () => tensionBuffer, () => perVertexStream, () => indexBuffer,
+                        () =>
+                        {
+                            Bounds b = new Bounds();
+                            // TODO:: REMOVE GC ALLOCATION, fixed or stack allocation as c# Array
+                            Vector3[] p = new Vector3[2];
+                            minmaxBoundsBuffer.GetData(p);
+                            b.center = (p[0] + p[1]) / 2.0f;
+                            b.extents = (p[1] - p[0]) / 2.0f;
+
+                            return b;
+                        }
+                    );
             }
         }
         
@@ -158,7 +187,7 @@
 
         public uint maxThreadSizeX;
         
-        public DataToDataDispatcher(ComputeShader computeShader, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexStream)
+        public DataToDataDispatcher(ComputeShader computeShader, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexStream, Func<ComputeBuffer> getMinMaxBoundsBuffer)
         {
             uint maxThreadSizeY;
             uint maxThreadSizeZ;
@@ -175,6 +204,7 @@
             computeShader.SetInt("vertexCount", vertexCount);
             computeShader.SetBuffer(kernelIndex, "vertices", buffer);
             computeShader.SetBuffer(kernelIndex, "output", getPerVertexStream());
+            computeShader.SetBuffer(kernelIndex, "minmax", getMinMaxBoundsBuffer());
         }
 
         public void Dispatch()
@@ -203,7 +233,11 @@
         public Transform[] bones;
         public Matrix4x4[] currentPoseMatrixArray;
 
-        public LinearBlendSkinningDispatcher(ComputeShader computeShader, RenderChunk chunk, Transform[] bones, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream)
+        public LinearBlendSkinningDispatcher(
+            ComputeShader computeShader, RenderChunk chunk, Transform[] bones, 
+            Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream,
+            Func<ComputeBuffer> getMinMaxBoundsBuffer
+            )
         {
             this.computeShader = computeShader;
             kernelIndex = computeShader.FindKernel("LinearBlendCompute");
@@ -230,6 +264,7 @@
             computeShader.SetBuffer(kernelIndex, "vertices", getPerVertexBuffer());
             computeShader.SetBuffer(kernelIndex, "skin", getPerVertexSkinBuffer());
             computeShader.SetBuffer(kernelIndex, "output", getPerVertexStream());
+            computeShader.SetBuffer(kernelIndex, "minmax", getMinMaxBoundsBuffer());
         }
         
         public void Dispatch()
@@ -268,7 +303,11 @@
         public Transform[] bones;
         public DualQuaternion[] currentPoseDQArray;
 
-        public DualQuaternionBlendSkinningDispatcher(ComputeShader computeShader, RenderChunk chunk, Transform[] bones, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream)
+        public DualQuaternionBlendSkinningDispatcher(
+            ComputeShader computeShader, RenderChunk chunk, Transform[] bones, 
+            Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream,
+            Func<ComputeBuffer> getMinMaxBoundsBuffer
+            )
         {
             this.computeShader = computeShader;
             kernelIndex = computeShader.FindKernel("DualQuaternionBlendCompute");
@@ -292,6 +331,7 @@
             computeShader.SetBuffer(kernelIndex, "vertices", getPerVertexBuffer());
             computeShader.SetBuffer(kernelIndex, "skin", getPerVertexSkinBuffer());
             computeShader.SetBuffer(kernelIndex, "output", getPerVertexStream());
+            computeShader.SetBuffer(kernelIndex, "minmax", getMinMaxBoundsBuffer());
         }
 
         public void Dispatch()
@@ -331,7 +371,11 @@
 
         public ComputeBuffer vertexCenterOfRotationBuffer;
 
-        public OptimizedCenterOfRotationSkinningDispatcher(ComputeShader computeShader, RenderChunk chunk, Transform[] bones, Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream)
+        public OptimizedCenterOfRotationSkinningDispatcher(
+            ComputeShader computeShader, RenderChunk chunk, Transform[] bones, 
+            Func<ComputeBuffer> getPerVertexBuffer, Func<ComputeBuffer> getPerVertexSkinBuffer, Func<ComputeBuffer> getPerVertexStream,
+            Func<ComputeBuffer> getMinMaxBoundsBuffer
+            )
         {
             uint maxThreadSizeY, maxThreadSizeZ;
 
@@ -371,6 +415,7 @@
             computeShader.SetBuffer(kernelIndex, "vertices", getPerVertexBuffer());
             computeShader.SetBuffer(kernelIndex, "skin", getPerVertexSkinBuffer());
             computeShader.SetBuffer(kernelIndex, "output", getPerVertexStream());
+            computeShader.SetBuffer(kernelIndex, "minmax", getMinMaxBoundsBuffer());
         }
 
         public void Dispatch()
@@ -408,11 +453,11 @@
         public ComputeShader computeShader;
 
         public Func<ComputeBuffer> getPerVertexStream;
-        public Func<ComputeBuffer> getIndexBuffer;
+        public Func<GraphicsBuffer> getIndexBuffer;
         public Func<ComputeBuffer> getEdgeLengthBuffer;
         public Func<ComputeBuffer> getTensionPerVertex;
 
-        public TensionDispatcher(ComputeShader computeShader, RenderChunk chunk, Func<ComputeBuffer> getPerVertexStream, Func<ComputeBuffer> getIndexBuffer,  Func<ComputeBuffer> getEdgeLengthBuffer, Func<ComputeBuffer> getTensionPerVertex)
+        public TensionDispatcher(ComputeShader computeShader, RenderChunk chunk, Func<ComputeBuffer> getPerVertexStream, Func<GraphicsBuffer> getIndexBuffer,  Func<ComputeBuffer> getEdgeLengthBuffer, Func<ComputeBuffer> getTensionPerVertex)
         {
             this.computeShader = computeShader;
 
@@ -446,20 +491,21 @@
     {
         public Material material;
 
-        public Func<ComputeBuffer> getIndexBuffer;
-        public Func<ComputeBuffer> getIndexCountBuffer;
+        public Func<GraphicsBuffer> getIndexBuffer;
         public Func<ComputeBuffer> getPerVertexStream;
+        public Func<Bounds> getBounds;
 
-        public ComputeShaderRenderer(RenderChunk chunk, Material material, Func<ComputeBuffer> getPerVertexStream, Func<ComputeBuffer> getIndexBuffer, Func<ComputeBuffer> getIndexCountBuffer)
+        public ComputeShaderRenderer(
+            RenderChunk chunk, Material material, 
+            Func<ComputeBuffer> getPerVertexStream, Func<GraphicsBuffer> getIndexBuffer, Func<Bounds> getBounds
+            )
         {
             this.material = material;
 
             this.getIndexBuffer = getIndexBuffer;
-            this.getIndexCountBuffer = getIndexCountBuffer;
             this.getPerVertexStream = getPerVertexStream;
+            this.getBounds = getBounds;
 
-            material.SetBuffer("triangles", getIndexBuffer());
-            material.SetBuffer("triCountPerTextureIndex", getIndexCountBuffer());
             material.SetBuffer("dataPerVertex", getPerVertexStream());
         }
 
@@ -470,8 +516,7 @@
         public void OnRenderObject()
         {
             material.SetPass(0);
-
-            Graphics.DrawProcedural(MeshTopology.Triangles, getIndexBuffer().count);
+            Graphics.DrawProceduralNow(MeshTopology.Triangles, getIndexBuffer(), getIndexBuffer().count);
         }
     }
 
@@ -479,13 +524,15 @@
     {
         public Material material;
 
-        public Func<ComputeBuffer> getIndexBuffer;
-        public Func<ComputeBuffer> getIndexCountBuffer;
-
+        public Func<GraphicsBuffer> getIndexBuffer;
         public Func<ComputeBuffer> getPerVertexStream;
         public Func<ComputeBuffer> getTensionBuffer;
+        public Func<Bounds> getBounds;
 
-        public TensionRenderer(RenderChunk chunk, Material material, Func<ComputeBuffer> getTensionBuffer, Func<ComputeBuffer> getPerVertexStream, Func<ComputeBuffer> getIndexBuffer, Func<ComputeBuffer> getIndexCountBuffer)
+        public TensionRenderer(
+            RenderChunk chunk, Material material, 
+            Func<ComputeBuffer> getTensionBuffer, Func<ComputeBuffer> getPerVertexStream, Func<GraphicsBuffer> getIndexBuffer, Func<Bounds> getBounds
+            )
         {
             this.material = material;
 
@@ -493,10 +540,8 @@
             this.getTensionBuffer = getTensionBuffer;
 
             this.getIndexBuffer = getIndexBuffer;
-            this.getIndexCountBuffer = getIndexCountBuffer;
+            this.getBounds = getBounds;
 
-            material.SetBuffer("triangles", getIndexBuffer());
-            material.SetBuffer("triCountPerTextureIndex", getIndexCountBuffer());
             material.SetBuffer("dataPerVertex", getPerVertexStream());
             material.SetBuffer("tension", getTensionBuffer());
         }
@@ -508,8 +553,7 @@
         public void OnRenderObject()
         {
             material.SetPass(0);
-
-            Graphics.DrawProcedural(MeshTopology.Triangles, getIndexBuffer().count);
+            Graphics.DrawProceduralNow(MeshTopology.Triangles, getIndexBuffer(), getIndexBuffer().count);
         }
     }
 }
